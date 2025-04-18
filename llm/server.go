@@ -161,12 +161,61 @@ func NewLlamaServer(gpus discover.GpuInfoList, modelPath string, f *ggml.GGML, a
 		}
 	}
 
-	defaultThreads := systemInfo.GetOptimalThreadCount()
-	if opts.NumThread > 0 {
-		params = append(params, "--threads", strconv.Itoa(opts.NumThread))
-	} else if defaultThreads > 0 {
-		params = append(params, "--threads", strconv.Itoa(defaultThreads))
+// 1. Determine the intended number of threads without considering the max cap yet
+defaultThreads := systemInfo.GetOptimalThreadCount()
+intendedThreads := defaultThreads // Start with the system's calculated default
+
+if opts.NumThread > 0 {
+	// The num_thread parameter from Modelfile or API options takes precedence
+	// over the system's calculated default.
+	intendedThreads = opts.NumThread
+}
+
+// 2. Read and parse the OLLAMA_MAX_THREADS environment variable
+maxThreads := -1 // Use -1 to indicate no max cap is set or it's invalid
+
+envMaxThreads := os.Getenv("OLLAMA_MAX_THREADS")
+if envMaxThreads != "" {
+	parsedMaxThreads, err := strconv.Atoi(envMaxThreads)
+	if err == nil && parsedMaxThreads > 0 {
+		// Only use the parsed value if it's a valid positive integer
+		maxThreads = parsedMaxThreads
+		log.Printf("INFO OLLAMA_MAX_THREADS environment variable set to %d", maxThreads)
+	} else {
+		log.Printf("WARN Invalid value '%s' for OLLAMA_MAX_THREADS environment variable. Ignoring max cap.", envMaxThreads)
 	}
+}
+
+// 3. Determine the final thread count by applying the maximum cap
+finalThreads := intendedThreads // Start with the intended value
+
+if maxThreads > 0 && intendedThreads > maxThreads {
+	// If a valid max cap is set AND the intended count exceeds it,
+	// use the max cap instead.
+	finalThreads = maxThreads
+	log.Printf("INFO Capping runner threads at OLLAMA_MAX_THREADS=%d (intended was %d)", finalThreads, intendedThreads)
+} else {
+	// Otherwise (no cap, invalid cap, or intended <= cap),
+	// use the intended thread count.
+	// Optional: Add a log here to indicate the intended value is being used.
+	// log.Printf("INFO Using intended runner threads %d (no cap applied or intended <= cap)", finalThreads)
+}
+
+
+// 4. Append the --threads parameter to the command, ensuring it's at least 1 if possible
+// The logic above should ideally result in finalThreads > 0 if defaultThreads > 0
+// But adding a safety check for completeness.
+if finalThreads > 0 {
+	params = append(params, "--threads", strconv.Itoa(finalThreads))
+} else if defaultThreads > 0 && opts.NumThread <= 0 {
+	// Fallback to original default calculation if *neither* Modelfile/API *nor* a valid positive cap resulted in > 0
+	// This scenario is less likely with the max cap logic, but good to keep a fallback.
+	 params = append(params, "--threads", strconv.Itoa(defaultThreads))
+} else {
+	// Absolute minimum fallback, should ideally not be hit if GetOptimalThreadCount > 0
+	params = append(params, "--threads", strconv.Itoa(1))
+	log.Printf("WARN Calculated final threads <= 0, defaulting to 1.")
+}
 
 	fa := envconfig.FlashAttention()
 	if fa && !gpus.FlashAttentionSupported() {
@@ -1032,3 +1081,4 @@ func (s *llmServer) EstimatedVRAMByGPU(gpuID string) uint64 {
 	}
 	return 0
 }
+
